@@ -1,0 +1,647 @@
+from __future__ import annotations
+
+import html
+import json
+import logging
+import os
+import smtplib
+from datetime import datetime, timezone
+from email.message import EmailMessage
+from pathlib import Path
+from typing import Any, Dict, List, Set, Tuple
+
+from dotenv import load_dotenv
+from openai import OpenAI
+
+from backfill import is_completed_stream, is_restricted_error, run_ytdlp_json
+
+from research import (
+    _research_cutoff,
+    annotate_research_with_backtest,
+    build_channel_playbook,
+    channel_playbook_is_stale,
+    connect_db,
+    extract_video_research,
+    latest_research,
+    load_channel_playbook,
+    portfolio_snapshot,
+    reliability_summary,
+    save_video_research,
+    update_performance,
+)
+from signal_model import (
+    annotate_research_with_model,
+    load_signal_model,
+    signal_model_is_stale,
+    train_signal_model,
+)
+from candidate_screening import build_new_candidate_universe, eligible_new_tickers
+from holding_screening import actionable_holding_reviews, build_holding_reviews
+
+ROOT = Path(__file__).resolve().parent
+REPORT_DIR = ROOT / "reports"
+DELIVERY_STATE = ROOT / "delivery_state.json"
+PORTFOLIO_PATH = ROOT / "portfolio.json"
+ETF_TICKERS = {"SPY", "VTI", "VT", "QQQ", "IWM", "XLF", "REMX", "SPCX", "SOXX", "TLT", "UUP", "GLD"}
+REPORT_VERSION = "2.0.3"
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).lower() in {"1", "true", "yes", "on"}
+
+
+def require_env(*names: str) -> None:
+    missing = [name for name in names if not os.getenv(name)]
+    if missing:
+        raise RuntimeError("Missing required .env values: " + ", ".join(missing))
+
+
+def load_delivery_state() -> Dict[str, Any]:
+    if not DELIVERY_STATE.exists():
+        return {"sent_video_ids": []}
+    return json.loads(DELIVERY_STATE.read_text(encoding="utf-8"))
+
+
+def save_delivery_state(state: Dict[str, Any]) -> None:
+    temp = DELIVERY_STATE.with_suffix(".tmp")
+    temp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(DELIVERY_STATE)
+
+
+def stream_candidates(
+    channel_id: str, sent: set, limit: int
+) -> Tuple[List[Dict[str, str]], Set[str]]:
+    url = f"https://www.youtube.com/channel/{channel_id}/streams"
+    info = run_ytdlp_json([
+        "--flat-playlist", "--playlist-end", "50", "--dump-single-json", url
+    ])
+    channel_name = info.get("channel") or info.get("uploader") or channel_id
+    result = []
+    ignored: Set[str] = set()
+    for entry in info.get("entries") or []:
+        video_id = entry.get("id")
+        if not video_id or video_id in sent:
+            continue
+        if entry.get("availability") in {
+            "subscriber_only", "premium_only", "needs_auth", "private"
+        }:
+            logging.info("Skipping restricted stream %s", video_id)
+            ignored.add(video_id)
+            continue
+        try:
+            detail = run_ytdlp_json([
+                "--skip-download", "--dump-single-json",
+                f"https://www.youtube.com/watch?v={video_id}",
+            ])
+        except Exception as exc:
+            if is_restricted_error(exc):
+                logging.info("Skipping members-only stream %s", video_id)
+                ignored.add(video_id)
+            else:
+                logging.warning("Could not inspect stream %s: %s", video_id, exc)
+            continue
+
+        if not is_completed_stream(detail):
+            if detail.get("live_status") not in {"is_live", "is_upcoming"}:
+                ignored.add(video_id)
+            continue
+
+        stamp = detail.get("release_timestamp") or detail.get("timestamp")
+        upload_date = detail.get("upload_date")
+        if stamp:
+            published_date = datetime.fromtimestamp(stamp, timezone.utc).date().isoformat()
+        elif upload_date and len(upload_date) == 8:
+            published_date = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}"
+        else:
+            logging.warning("No publication date for stream %s; retrying next run", video_id)
+            continue
+        result.append({
+            "channel_id": channel_id,
+            "channel_name": detail.get("channel") or detail.get("uploader") or channel_name,
+            "video_id": video_id,
+            "title": detail.get("title") or entry.get("title") or "Untitled",
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "published_date": published_date,
+            "description": detail.get("description") or "",
+            "content_type": "stream",
+        })
+        if len(result) >= limit:
+            break
+    return result, ignored
+
+
+def _generate_legacy_allocation_report(
+    portfolio: Dict[str, Any], reliability: List[Dict[str, Any]],
+    research: List[Dict[str, Any]], playbook: Dict[str, Any],
+    new_candidates: List[Dict[str, Any]],
+) -> str:
+    prompt = f"""You are an evidence-weighted portfolio research assistant. Return valid JSON
+without markdown. This is analysis only: do not provide order tickets, share quantities,
+limit prices, or claim certainty. Use Traditional Chinese for all prose.
+
+The IBKR account is a long-term fundamental portfolio. Change direction only for a material
+change in thesis, industry structure, valuation risk, or fundamentals. The Robinhood account
+is tactical with a 5-60 trading-day horizon. Keep the accounts separate.
+
+Return this shape:
+{{
+  "headline": "one-sentence conclusion",
+  "accounts": [
+    {{
+      "name": "IBKR or Robinhood",
+      "observations": ["..."],
+      "allocations": [
+        {{"ticker":"NVDA", "target_weight":0.10, "confidence":0.6,
+          "reason":"...", "evidence":"...", "evidence_type":"latest_stream|historical_playbook|independent_data|insufficient", "invalidation":"..."}}
+      ],
+      "risks": ["..."]
+    }}
+  ],
+  "channel_assessment": ["..."],
+  "missing_information": ["..."]
+}}
+
+For each account:
+1. Include every current holding, plus any proposed new ticker.
+2. target_weight is a decimal from 0 to 1. Targets plus cash should be <= 1.
+3. Confidence is 0 to 1.
+4. New tickers may be proposed, but every single-stock target must be <= the account's
+   max_single_weight. Broad diversified ETFs may exceed it only when clearly identified.
+5. Explicitly distinguish evidence from the latest videos, historical channel reliability,
+   and independent portfolio-risk logic.
+6. Include dissent, invalidation conditions, and major missing information.
+7. Use only the supplied JSON as current evidence; do not rely on unstated model memory for
+   company-specific facts.
+8. When a ticker is absent from latest video signals, historical_playbook may provide an
+   indirect insight only if its sector/theme mapping is explicit and current market_evidence
+   supports the link. Otherwise keep its current weight, use evidence_type=insufficient, and
+   confidence <= 0.25.
+9. Fundamentals are cached weekly and may be missing. Never convert a missing value into a
+   positive or negative claim. Treat earnings dates as approximate research data.
+10. NEW_CANDIDATE_UNIVERSE contains tickers mentioned in recent streams but absent from both
+    accounts. A stream mention is only a discovery source. Propose a positive target for a new
+    ticker only when account_screening for that account is eligible_for_portfolio_review.
+11. For every eligible new candidate, include it in that account's allocations. Use a positive
+    target no greater than max_initial_weight only when it also fits the account's existing
+    exposures and cash; otherwise use target_weight=0 and explain the portfolio-level conflict.
+12. Never propose a new ticker omitted from NEW_CANDIDATE_UNIVERSE, and never turn a watchlist
+    candidate into a buy merely because a presenter was confident.
+
+Never treat a channel as skilled when its sample is small. Reliability uses SPY-relative
+forward returns and a shrunk hit rate. A video opinion is evidence, not ground truth.
+Each latest signal may include historical_backtest and trained_signal_model.
+Use historical_backtest.effective_stream_evidence_weight for the contribution of that
+video claim. A weak score reduces reliance; never invert a claim merely because its
+historical score or modeled probability is below 50%.
+
+The trained signal model is selected from conservative candidates using point-in-time
+trend, valuation, earnings, and industry-strength features. It is evaluated with purged,
+time-ordered walk-forward tests. Use its estimated_success_probability only when
+trained_signal_model.status is "active". When status is "experimental_not_activated",
+the model failed its activation gate: mention that limitation if relevant, but do not
+let its probability affect allocations or confidence. The AI-extracted confidence is
+only one model feature and must not override validation status.
+
+PORTFOLIO_JSON:
+{json.dumps(portfolio, ensure_ascii=False)}
+
+CHANNEL_RELIABILITY_JSON:
+{json.dumps(reliability, ensure_ascii=False)}
+
+LATEST_VIDEO_RESEARCH_JSON:
+{json.dumps(research, ensure_ascii=False)}
+
+HISTORICAL_CHANNEL_PLAYBOOK_JSON:
+{json.dumps(playbook, ensure_ascii=False)}
+
+NEW_CANDIDATE_UNIVERSE_JSON:
+{json.dumps(new_candidates, ensure_ascii=False)}
+"""
+    response = OpenAI().responses.create(
+        model=os.getenv("OPENAI_MODEL", "gpt-5-mini"), input=prompt
+    )
+    raw = response.output_text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
+    decision = json.loads(raw)
+    accounts_by_name = {a["name"]: a for a in portfolio["accounts"]}
+    output = [f"# {decision.get('headline', '每日投資方向研究')}", ""]
+    for account_decision in decision.get("accounts", []):
+        name = account_decision.get("name")
+        account = accounts_by_name.get(name)
+        if not account:
+            continue
+        output.extend([f"## {name}", ""])
+        for observation in account_decision.get("observations", []):
+            output.append(f"- {observation}")
+        if account_decision.get("observations"):
+            output.append("")
+        current = {
+            p["ticker"]: float(p.get("current_weight") or 0.0)
+            for p in account.get("positions_snapshot", [])
+        }
+        eligible = eligible_new_tickers(new_candidates, name)
+        proposed = {}
+        for item in account_decision.get("allocations", []):
+            ticker = str(item.get("ticker", "")).upper().strip()
+            if not ticker:
+                continue
+            target = float(item.get("target_weight", 0.0) or 0.0)
+            if target > 1.0:
+                target /= 100.0
+            target = max(0.0, target)
+            if ticker not in current:
+                if ticker not in eligible:
+                    # A language-model suggestion can never bypass the deterministic gate.
+                    continue
+                target = min(target, eligible[ticker])
+            if ticker not in ETF_TICKERS:
+                target = min(target, float(account["max_single_weight"]))
+            proposed[ticker] = {
+                "target": target,
+                "confidence": max(0.0, min(1.0, float(item.get("confidence", 0.0) or 0.0))),
+                "reason": str(item.get("reason", "")),
+                "evidence": str(item.get("evidence", "")),
+                "evidence_type": str(item.get("evidence_type", "insufficient")),
+                "invalidation": str(item.get("invalidation", "")),
+            }
+        # Never silently drop an existing holding omitted by the model.
+        for ticker, weight in current.items():
+            if ticker not in proposed:
+                proposed[ticker] = {
+                    "target": min(weight, float(account["max_single_weight"])) if ticker not in ETF_TICKERS else weight,
+                    "confidence": 0.0,
+                    "reason": "模型未提供充分的新證據，暫以目前權重為基準。",
+                    "evidence": "無新增證據",
+                    "evidence_type": "insufficient",
+                    "invalidation": "取得新的基本面或價格證據後重評。",
+                }
+        total_target = sum(item["target"] for item in proposed.values())
+        if total_target > 1.0:
+            scale = 1.0 / total_target
+            for item in proposed.values():
+                item["target"] *= scale
+            total_target = 1.0
+        output.extend([
+            "| 代碼 | 目前權重 | 建議權重 | 方向 | 信心 | 依據與失效條件 |",
+            "|---|---:|---:|---|---:|---|",
+        ])
+        for ticker, item in sorted(proposed.items(), key=lambda pair: pair[1]["target"], reverse=True):
+            before = current.get(ticker, 0.0)
+            delta = item["target"] - before
+            action = "增加" if delta > 0.005 else "降低" if delta < -0.005 else "維持"
+            detail = (
+                f"{item['reason']}；證據類型：{item['evidence_type']}；"
+                f"證據：{item['evidence']}；失效：{item['invalidation']}"
+            )
+            detail = detail.replace("|", "/").replace("\n", " ")
+            output.append(
+                f"| {ticker} | {before:.1%} | {item['target']:.1%} | {action} | "
+                f"{item['confidence']:.0%} | {detail} |"
+            )
+        output.extend([f"| 現金 | — | {max(0.0, 1.0-total_target):.1%} | — | — | 風險緩衝與待確認機會 |", ""])
+        if account_decision.get("risks"):
+            output.append("主要風險：")
+            output.extend(f"- {risk}" for risk in account_decision["risks"])
+            output.append("")
+    output.append("## 頻道歷史證據")
+    output.extend(f"- {item}" for item in decision.get("channel_assessment", []))
+    output.extend(["", "## 資料缺口"])
+    output.extend(f"- {item}" for item in decision.get("missing_information", []))
+    output.extend(["", "## 直播新標的候選清單", ""])
+    if not new_candidates:
+        output.append("最近直播沒有提到你目前未持有的標的。")
+    else:
+        output.extend([
+            "直播只負責發現標的；下列狀態由價格、相對強弱、估值、基本面與財報時點獨立篩選。",
+            "",
+            "| 代碼 | IBKR | Robinhood | 趨勢/產業 | 估值資料 | 基本面 | 主要未通過原因 |",
+            "|---|---|---|---:|---:|---:|---|",
+        ])
+        for candidate in new_candidates:
+            screens = candidate.get("account_screening", {})
+            ibkr = screens.get("IBKR", {})
+            rh = screens.get("Robinhood", {})
+            ibkr_label = (
+                "可考慮新增（上限5%）"
+                if ibkr.get("status") == "eligible_for_portfolio_review" else "觀察"
+            )
+            rh_label = (
+                "可考慮新增（上限3%）"
+                if rh.get("status") == "eligible_for_portfolio_review" else "觀察"
+            )
+            score = rh.get("scorecard", {})
+            reasons = list(dict.fromkeys(
+                ibkr.get("failed_or_missing_checks", [])
+                + rh.get("failed_or_missing_checks", [])
+            ))
+            reason_text = "；".join(reasons[:4]) or "已通過硬性門檻，仍需檢查組合重疊與現金"
+            reason_text = reason_text.replace("|", "/").replace("\n", " ")
+            output.append(
+                f"| {candidate['ticker']} | {ibkr_label} | {rh_label} | "
+                f"{score.get('momentum_and_relative_strength', '—')} | "
+                f"{score.get('valuation_metrics_available', '—')} | "
+                f"{score.get('fundamentals', '—')} | {reason_text} |"
+            )
+    output.extend(["", "> 本報告僅供研究；不會建立或傳送任何交易指令。"])
+    return "\n".join(output)
+
+
+def generate_allocation_report(
+    portfolio: Dict[str, Any], reliability: List[Dict[str, Any]],
+    research: List[Dict[str, Any]], playbook: Dict[str, Any],
+    new_candidates: List[Dict[str, Any]],
+    holding_reviews: Dict[str, List[Dict[str, Any]]] | None = None,
+    stream_model_active: bool = False,
+) -> str:
+    """Render a compact, deterministic report.
+
+    Reliability and playbook data remain upstream research inputs, but they do
+    not alter portfolio actions unless the trained signal model is active.
+    """
+    del portfolio, reliability, research, playbook
+    holding_reviews = holding_reviews or {}
+    holding_actions = actionable_holding_reviews(holding_reviews)
+
+    def pct(value: Any) -> str:
+        try:
+            return f"{float(value):.1%}"
+        except (TypeError, ValueError):
+            return "—"
+
+    def number(value: Any, digits: int = 1) -> str:
+        try:
+            return f"{float(value):.{digits}f}"
+        except (TypeError, ValueError):
+            return "—"
+
+    def signed_pct(value: Any) -> str:
+        try:
+            return f"{float(value):+.1%}"
+        except (TypeError, ValueError):
+            return "—"
+
+    def candidate_limits(item: Dict[str, Any]) -> str:
+        return "；".join(
+            f"{name} ≤{weight:.0%}" for name, weight in item["accounts"]
+        )
+
+    def candidate_reason(candidate: Dict[str, Any]) -> str:
+        fundamentals = candidate.get("fundamentals", {})
+        is_etf = (
+            candidate.get("ticker") in ETF_TICKERS
+            or str(fundamentals.get("quoteType") or "").upper() == "ETF"
+        )
+        if is_etf:
+            positive: List[str] = []
+            negative: List[str] = []
+            checks = (
+                ("20日報酬", candidate.get("return_20d")),
+                ("60日報酬", candidate.get("return_60d")),
+                ("20日相對SPY", candidate.get("relative_spy_20d")),
+            )
+            for label, value in checks:
+                try:
+                    bucket = positive if float(value) > 0 else negative
+                    bucket.append(f"{label}{signed_pct(value)}")
+                except (TypeError, ValueError):
+                    continue
+            result = "ETF；通過：" + ("、".join(positive) or "無可用正向項目")
+            if negative:
+                result += "；未通過：" + "、".join(negative)
+            return result + "。ETF不適用公司P/E、營收、獲利與財報日期。"
+
+        facts: List[str] = []
+        if candidate.get("return_20d") is not None:
+            facts.append(f"20日報酬{signed_pct(candidate.get('return_20d'))}")
+        if fundamentals.get("forwardPE") is not None:
+            facts.append(f"Forward P/E {number(fundamentals.get('forwardPE'))}")
+        if fundamentals.get("revenueGrowth") is not None:
+            facts.append(f"營收成長{signed_pct(fundamentals.get('revenueGrowth'))}")
+        if fundamentals.get("earningsGrowth") is not None:
+            facts.append(f"獲利成長{signed_pct(fundamentals.get('earningsGrowth'))}")
+        return "通過股票初篩：" + ("、".join(facts) or "趨勢、估值與基本面門檻") + "；仍需人工研究。"
+
+    eligible: List[Dict[str, Any]] = []
+    watchlist: List[Dict[str, Any]] = []
+    for candidate in new_candidates:
+        accounts = []
+        for name in ("IBKR", "Robinhood"):
+            screen = candidate.get("account_screening", {}).get(name, {})
+            if screen.get("status") == "eligible_for_portfolio_review":
+                accounts.append((name, float(screen.get("max_initial_weight", 0.0))))
+        if accounts:
+            eligible.append({"candidate": candidate, "accounts": accounts})
+        else:
+            watchlist.append(candidate)
+
+    displayed_eligible = eligible[:3]
+    action_count = len(holding_actions) + len(displayed_eligible)
+    headline = (
+        f"今日有 {action_count} 項需要檢視"
+        if action_count else "今日沒有足夠證據支持調整持股"
+    )
+    output = [f"# {headline}", "", f"版本：v{REPORT_VERSION}", ""]
+
+    output.extend(["## 今日結論", ""])
+    if not action_count:
+        output.append("- 今日無建議交易；既有持股維持，新標的只保留研究線索。")
+    else:
+        if holding_actions:
+            output.append(f"- 既有持股：{len(holding_actions)} 檔達到減碼、清倉或集中度門檻。")
+        if displayed_eligible:
+            output.append(
+                f"- 新標的：{len(displayed_eligible)} 檔通過初篩，列為研究候選；並非買入指示。"
+            )
+    if not stream_model_active:
+        output.append("- 直播預測模型尚未通過啟用門檻；直播只用來發現線索，不作為單獨買賣依據。")
+    output.append("")
+
+    output.extend(["## 建議動作", ""])
+    if not action_count:
+        output.append("無。")
+    else:
+        output.extend([
+            "| 帳戶 | 代碼 | 建議 | 權重／研究上限 | 一句理由 |",
+            "|---|---|---|---:|---|",
+        ])
+        labels = {
+            "consider_exit": "可考慮清倉",
+            "consider_reduce": "可考慮減碼",
+            "reduce_to_limit": "降至上限",
+        }
+        for item in holding_actions:
+            output.append(
+                f"| {item['account']} | {item['ticker']} | {labels[item['status']]} | "
+                f"{pct(item['current_weight'])} → {pct(item['target_weight'])} | "
+                f"{str(item['trigger']).replace('|', '/')} |"
+            )
+        for item in displayed_eligible:
+            candidate = item["candidate"]
+            accounts = "、".join(name for name, _ in item["accounts"])
+            limits = candidate_limits(item)
+            output.append(
+                f"| {accounts} | {candidate['ticker']} | 進一步研究 | {limits} | "
+                f"{candidate_reason(candidate).replace('|', '/')} |"
+            )
+    output.append("")
+
+    output.extend(["## 新標的與退出警示", ""])
+    output.append("新標的研究候選：" + (
+        "、".join(item["candidate"]["ticker"] for item in displayed_eligible)
+        if displayed_eligible else "無"
+    ))
+    exits = [item["ticker"] for item in holding_actions if item["status"] == "consider_exit"]
+    reductions = [item["ticker"] for item in holding_actions if item["status"] != "consider_exit"]
+    output.append("可考慮清倉：" + ("、".join(exits) if exits else "無"))
+    output.append("可考慮減碼／集中度調整：" + ("、".join(reductions) if reductions else "無"))
+    output.append("觀察名單（最多 5 檔）：" + (
+        "、".join(item["ticker"] for item in watchlist[:5]) if watchlist else "無"
+    ))
+    output.append("")
+
+    output.extend(["## 證據明細", ""])
+    if holding_actions:
+        output.extend([
+            "### 既有持股", "",
+            "| 帳戶 | 代碼 | 直播訊號 | 20日 | 60日 | 120日 | 相對SPY | 相對產業 | 確認風險 |",
+            "|---|---|---|---:|---:|---:|---:|---:|---|",
+        ])
+        for item in holding_actions:
+            stream = item.get("stream_signals", {})
+            metrics = item.get("metrics", {})
+            long_term = item["account"] == "IBKR"
+            relative_spy = metrics.get("relative_spy_120d" if long_term else "relative_spy_20d")
+            relative_sector = metrics.get("relative_sector_120d" if long_term else "relative_sector_60d")
+            flags = (
+                ["集中度超過 15%"]
+                if item.get("status") == "reduce_to_limit"
+                else item.get("market_red_flags", []) + item.get("fundamental_red_flags", [])
+            )
+            output.append(
+                f"| {item['account']} | {item['ticker']} | 多{stream.get('bullish', 0)}／空{stream.get('bearish', 0)} | "
+                f"{pct(metrics.get('return_20d'))} | {pct(metrics.get('return_60d'))} | "
+                f"{pct(metrics.get('return_120d'))} | {pct(relative_spy)} | {pct(relative_sector)} | "
+                f"{'；'.join(flags[:4]) or '僅集中度超限'} |"
+            )
+        output.append("")
+
+    if displayed_eligible:
+        output.extend(["### 通過的新標的", ""])
+        for item in displayed_eligible:
+            candidate = item["candidate"]
+            output.append(
+                f"- **{candidate['ticker']}**（{candidate_limits(item)}）："
+                f"{candidate_reason(candidate)}"
+            )
+        output.append("")
+
+    if watchlist:
+        output.extend(["### 觀察名單未通過原因", ""])
+        for candidate in watchlist[:5]:
+            reasons: List[str] = []
+            for screen in candidate.get("account_screening", {}).values():
+                reasons.extend(screen.get("failed_or_missing_checks", []))
+            unique = list(dict.fromkeys(reasons))
+            output.append(f"- {candidate['ticker']}：{'；'.join(unique[:2]) or '獨立證據不足'}")
+        output.append("")
+
+    output.extend([
+        "> 僅分析美國交易所掛牌股票／ETF；海外本地股、重複公司曝險、無行情及已失效代碼已排除。",
+        "> 本報告僅供研究；不會建立或傳送任何交易指令。",
+    ])
+    return "\n".join(output)
+
+
+def send_email(subject: str, body: str) -> None:
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = os.getenv("EMAIL_FROM") or os.getenv("SMTP_USERNAME")
+    msg["To"] = os.getenv("EMAIL_TO")
+    msg.set_content(body)
+    escaped = html.escape(body)
+    msg.add_alternative(
+        '<html><body><pre style="white-space:pre-wrap;font-family:Arial,sans-serif;'
+        'font-size:14px;line-height:1.5">' + escaped + "</pre></body></html>",
+        subtype="html",
+    )
+    with smtplib.SMTP(os.getenv("SMTP_HOST"), int(os.getenv("SMTP_PORT", "587")), timeout=30) as smtp:
+        smtp.starttls()
+        smtp.login(os.getenv("SMTP_USERNAME"), os.getenv("SMTP_PASSWORD"))
+        smtp.send_message(msg)
+
+
+def main() -> int:
+    load_dotenv(ROOT / ".env")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.info("Investment brief version v%s", REPORT_VERSION)
+    require_env(
+        "YOUTUBE_CHANNEL_IDS", "OPENAI_API_KEY", "SMTP_HOST", "SMTP_USERNAME",
+        "SMTP_PASSWORD", "EMAIL_TO",
+    )
+    state = load_delivery_state()
+    sent = set(state.get("sent_video_ids", []))
+    limit = int(os.getenv("MAX_NEW_VIDEOS_PER_CHANNEL", "1"))
+    channels = [x.strip() for x in os.getenv("YOUTUBE_CHANNEL_IDS", "").split(",") if x.strip()]
+    batches = [stream_candidates(channel, sent, limit) for channel in channels]
+    candidates = [item for items, _ in batches for item in items]
+    ignored_ids = {video_id for _, ignored in batches for video_id in ignored}
+    if not candidates:
+        logging.info("No new completed public streams found.")
+        logging.info("Generating holdings report from historical playbook and independent data.")
+
+    conn = connect_db()
+    for item in candidates:
+        exists = conn.execute(
+            "SELECT 1 FROM videos WHERE video_id = ? AND content_type = 'stream'",
+            (item["video_id"],),
+        ).fetchone()
+        if not exists:
+            data = extract_video_research(**item)
+            save_video_research(conn, data)
+    update_performance(conn)
+    portfolio = portfolio_snapshot(PORTFOLIO_PATH)
+    backtest_days = int(os.getenv("BACKFILL_DAYS", "183"))
+    model_cutoff = _research_cutoff(conn, backtest_days)
+    if signal_model_is_stale(conn, cutoff=model_cutoff):
+        train_signal_model(conn, cutoff=model_cutoff)
+    reliability = reliability_summary(conn, days=backtest_days)
+    recent = latest_research(conn, days=int(os.getenv("LATEST_SIGNAL_DAYS", "7")))
+    if channel_playbook_is_stale():
+        build_channel_playbook(conn, days=backtest_days)
+    playbook = load_channel_playbook()
+    weighted_recent = annotate_research_with_backtest(recent, playbook)
+    signal_artifact = load_signal_model()
+    modeled_recent = annotate_research_with_model(weighted_recent, signal_artifact)
+    stream_model_active = bool(
+        signal_artifact and signal_artifact.get("report", {}).get("active")
+    )
+    new_candidates = build_new_candidate_universe(portfolio, modeled_recent)
+    holding_reviews = build_holding_reviews(portfolio, modeled_recent)
+    report = generate_allocation_report(
+        portfolio, reliability, modeled_recent, playbook, new_candidates,
+        holding_reviews=holding_reviews,
+        stream_model_active=stream_model_active,
+    )
+    REPORT_DIR.mkdir(exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    report_path = REPORT_DIR / f"investment-brief-{stamp}.md"
+    report_path.write_text(report, encoding="utf-8")
+    send_email(f"投資頻道與持股方向｜{stamp}｜{len(candidates)} 場新直播", report)
+
+    state["sent_video_ids"] = list(dict.fromkeys(
+        state.get("sent_video_ids", []) + list(ignored_ids)
+        + [item["video_id"] for item in candidates]
+    ))[-2000:]
+    state["last_success_utc"] = datetime.now(timezone.utc).isoformat()
+    save_delivery_state(state)
+    logging.info("Sent allocation report: %s", report_path)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception:
+        logging.exception("Daily investment brief failed")
+        raise SystemExit(1)

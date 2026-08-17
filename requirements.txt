@@ -1,0 +1,24 @@
+{
+  "accounts": [
+    {
+      "name": "IBKR",
+      "strategy": "long_term_fundamental",
+      "cash_usd": 5000.0,
+      "max_single_weight": 0.15,
+      "positions": {
+        "AAPL": 10,
+        "SPY": 5
+      }
+    },
+    {
+      "name": "Robinhood",
+      "strategy": "tactical_5_to_60_trading_days",
+      "cash_usd": 2000.0,
+      "max_single_weight": 0.15,
+      "positions": {
+        "NVDA": 8
+      }
+    }
+  ]
+}
+
