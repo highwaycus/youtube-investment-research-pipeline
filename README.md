@@ -80,20 +80,20 @@ The project intentionally separates **content discovery** from **portfolio actio
 
 ```text
 youtube-daily-brief/
-��鎿��� main.py                    # Daily pipeline, report generation, and email delivery
-��鎿��� backfill.py                # Resumable historical livestream ingestion
-��鎿��� research.py                # Transcript extraction, persistence, and backtesting
-��鎿��� market_features.py         # Price, benchmark, sector, and fundamental features
-��鎿��� candidate_screening.py     # Rules for newly discovered securities
-��鎿��� holding_screening.py       # Rules for existing holdings
-��鎿��� signal_model.py            # Walk-forward model training and activation gate
-��鎿��� train_signal_model.py      # Standalone model training entry point
-��鎿��� portfolio.example.json     # Sanitized portfolio configuration template
-��鎿��� .env.example               # Environment-variable template
-��鎿��� requirements.txt
-��鎿��� setup_windows.bat
-��鎿��� run.bat
-��婙��� test_report_v2.py
+├── main.py                    # Daily pipeline, report generation, and email delivery
+├── backfill.py                # Resumable historical livestream ingestion
+├── research.py                # Transcript extraction, persistence, and backtesting
+├── market_features.py         # Price, benchmark, sector, and fundamental features
+├── candidate_screening.py     # Rules for newly discovered securities
+├── holding_screening.py       # Rules for existing holdings
+├── signal_model.py            # Walk-forward model training and activation gate
+├── train_signal_model.py      # Standalone model training entry point
+├── portfolio.example.json     # Sanitized portfolio configuration template
+├── .env.example               # Environment-variable template
+├── requirements.txt
+├── setup_windows.bat
+├── run.bat
+└── test_report_v2.py
 ```
 
 ## Getting started on Windows
