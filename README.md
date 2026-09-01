@@ -1,10 +1,6 @@
 # YouTube Daily Brief
 
-An evidence-weighted investment research pipeline that turns public YouTube livestreams into a daily portfolio brief.
-
-The project was built as a Windows-first personal research tool. It collects completed livestreams from configurable YouTube channels, extracts structured market views with the OpenAI API, evaluates historical calls against subsequent returns, combines them with market and fundamental data, and emails a concise report for two portfolios with different time horizons.
-
-> **Research only.** The application never signs in to a brokerage, creates orders, or executes trades.
+This project turns public YouTube investment livestreams into a daily research brief for my portfolios. It extracts each channel’s market views, checks them against historical performance and current market data, and emails the conclusions without connecting to a brokerage.
 
 ## Why I built it
 
@@ -17,6 +13,8 @@ This project converts those videos into a repeatable research process:
 - Did comparable historical calls outperform SPY after 5, 20, or 60 trading days?
 - Does the current price, sector trend, valuation, or fundamental data support the claim?
 - Does the idea fit the intended account and its risk limits?
+
+> **Research only.** The application never signs in to a brokerage, creates orders, or executes trades.
 
 ## System overview
 
@@ -45,7 +43,7 @@ flowchart LR
 - **Independent candidate screening**: a livestream mention can discover an idea, but price trend, relative strength, valuation, fundamentals, volatility, and earnings timing determine whether it passes research screening.
 - **Account-specific logic**:
   - **IBKR**: long-term, fundamental thesis and valuation focused.
-  - **Robinhood**: tactical, primarily 5��60 trading days.
+  - **Robinhood**: tactical, primarily 5–60 trading days.
 - **Risk controls**: 15% maximum weight for an individual stock, plus smaller initial research limits for new positions.
 - **Local-first storage**: portfolio data, research history, reports, and credentials remain on the user's computer.
 - **Email delivery**: produces both a local Markdown report and an SMTP email.
@@ -195,7 +193,7 @@ Update `yt-dlp`, then start a backfill batch:
 .\run_backfill.bat
 ```
 
-Each run processes at most 10 videos even if a larger value is configured. The default is 5, with a randomized 20��40 second delay between transcript requests. Progress is persisted in `research.db`, so later runs resume where the previous run stopped.
+Each run processes at most 10 videos even if a larger value is configured. The default is 5, with a randomized 20–40 second delay between transcript requests. Progress is persisted in `research.db`, so later runs resume where the previous run stopped.
 
 Check progress with:
 
@@ -301,7 +299,7 @@ makes the project reusable and avoids presenting it as an endorsement of specifi
 - Restore concise per-stream summaries in the daily email.
 - Add an explicit cross-channel consensus and disagreement section.
 - Explain which current holdings were directly discussed and why the evidence matters.
-- Add a �菏hat changed since yesterday�� section.
+- Add a “what changed since yesterday” section.
 - Add sanitized sample data and end-to-end integration tests.
 - Support a configurable benchmark and sector ETF mapping.
 
